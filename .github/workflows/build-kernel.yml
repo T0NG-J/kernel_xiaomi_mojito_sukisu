@@ -150,6 +150,19 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           rm -rf ak3/.git ak3/.github
           cp anykernel/anykernel.sh ak3/anykernel.sh
+
+          # AnyKernel3 master ships a 32-bit ARM busybox as tools/busybox, which
+          # cannot exec on a 64-bit-only recovery - setup_bb then leaves bin/
+          # empty and update-binary aborts with "Busybox setup failed".
+          # Ship an aarch64 busybox as the primary and keep the 32-bit one at
+          # tools/arm/busybox: setup_bb prefers a 32-bit variant that actually
+          # runs, so this works on both kinds of device.
+          mkdir -p ak3/tools/arm
+          mv ak3/tools/busybox ak3/tools/arm/busybox
+          curl -fL --retry 5 --retry-all-errors -o ak3/tools/busybox \
+            https://github.com/Magisk-Modules-Repo/busybox-ndk/raw/master/busybox-arm64
+          chmod 755 ak3/tools/busybox ak3/tools/arm/busybox
+          file ak3/tools/busybox ak3/tools/arm/busybox || true
           cp out/arch/arm64/boot/Image ak3/Image
           NAME="NetErnels-SukiSU-SUSFS-$(cat out/include/config/kernel.release)-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)"
           (cd ak3 && zip -r9 "../${NAME}.zip" ./*)

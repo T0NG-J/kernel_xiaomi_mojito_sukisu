@@ -20,7 +20,11 @@ supported.patchlevels=
 
 ### AnyKernel install
 block=/dev/block/bootdevice/by-name/boot;
-is_slot_device=0;
+# This device is slot-based: PixelOS recovery reports "Active slot: a", so the
+# real partition is boot_a/boot_b. "auto" detects the active slot and appends
+# the suffix (ak3-core setup_ak), while still working on a non-slot device -
+# unlike "1", which aborts when no slot is found.
+is_slot_device=auto;
 ramdisk_compression=auto;
 patch_vbmeta_flag=auto;
 
