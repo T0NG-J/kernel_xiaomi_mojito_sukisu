@@ -129,3 +129,17 @@ kernel/configs/android-*.cfg
 #Ignoring Android.bp link file
 #
 Android.bp
+
+#
+# Build outputs and CI scratch for this tree
+#
+/out/
+/gcc64/
+/gcc32/
+/ak3/
+*.zip
+
+# Kept tracked on purpose (the leading-dot rule above would otherwise hide them)
+!.github/
+!.gitmodules
+!.scmversion

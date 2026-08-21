@@ -230,4 +230,6 @@ config XIMI_MOJITO
         default n
 
 
+source "drivers/kernelsu/Kconfig"
+
 endmenu
