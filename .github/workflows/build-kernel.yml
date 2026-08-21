@@ -1,0 +1,167 @@
+name: Build mojito kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu:
+        description: "Build with SukiSU-Ultra + SUSFS"
+        type: boolean
+        default: true
+  push:
+    branches: [ mojito-sukisu-susfs ]
+  pull_request:
+    branches: [ mojito-sukisu-susfs ]
+
+env:
+  DEFCONFIG: neternels_defconfig
+  KSU_FRAGMENT: arch/arm64/configs/ksu_susfs.config
+  # Match the stock PixelOS/NetErnels build so /proc/version does not stand out.
+  KBUILD_BUILD_USER: cyberknight777
+  KBUILD_BUILD_HOST: build-host
+
+jobs:
+  build:
+    # 24.04 on purpose: Eva GCC's bundled ld.lld and llvm-ar need GLIBC >= 2.36,
+    # which 22.04 (2.35) does not have. The trade-off is that 24.04 has no
+    # python2 package, so the dtbo.img step below is best-effort.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # kernel/Makefile derives KSU_VERSION from the commit count of SukiSU's
+      # main branch, via the GitHub API with a local git fallback. Make the
+      # fallback usable so the version stays correct if the API rate-limits.
+      - name: Prepare SukiSU version refs
+        run: |
+          git -C KernelSU fetch --no-tags origin main:main || true
+          git -C KernelSU log -1 --format='SukiSU pinned at %H (%ad) %s' --date=short
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev zip python3 rsync ccache
+
+      - name: Cache Eva GCC
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            gcc64
+            gcc32
+          key: eva-gcc-${{ hashFiles('kramel.sh') }}
+
+      # The same toolchains kramel.sh fetches, so the compiler string in
+      # /proc/version matches what NetErnels ships.
+      - name: Fetch Eva GCC
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-all-errors -o gcc64.tar.gz \
+            https://github.com/cyberknight777/gcc-arm64/archive/refs/heads/master.tar.gz
+          curl -fL --retry 5 --retry-all-errors -o gcc32.tar.gz \
+            https://github.com/cyberknight777/gcc-arm/archive/refs/heads/master.tar.gz
+          tar xzf gcc64.tar.gz && mv gcc-arm64-master gcc64
+          tar xzf gcc32.tar.gz && mv gcc-arm-master gcc32
+          rm -f gcc64.tar.gz gcc32.tar.gz
+          ./gcc64/bin/aarch64-elf-gcc --version | head -1
+          ./gcc64/bin/aarch64-elf-ld.lld --version | head -1
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-mojito-${{ github.sha }}
+          restore-keys: ccache-mojito-
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          make O=out ARCH=arm64 "$DEFCONFIG"
+          if [ "${{ github.event_name }}" != 'workflow_dispatch' ] || [ "${{ inputs.ksu }}" = 'true' ]; then
+            scripts/kconfig/merge_config.sh -m -O out out/.config "$KSU_FRAGMENT"
+            make O=out ARCH=arm64 olddefconfig
+          fi
+          grep -E '^(CONFIG_KSU|CONFIG_LOCALVERSION|CONFIG_QCA_CLD_WLAN)' out/.config
+
+      - name: Build Image
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/gcc32/bin:$PWD/gcc64/bin:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-elf- \
+            CROSS_COMPILE_ARM32=arm-eabi- \
+            LD="$PWD/gcc64/bin/aarch64-elf-ld.lld" \
+            AR=llvm-ar NM=llvm-nm OBJDUMP=llvm-objdump \
+            OBJCOPY=llvm-objcopy STRIP=llvm-strip \
+            HOSTAR=llvm-ar HOSTCC=gcc CC=aarch64-elf-gcc \
+            Image
+
+      # Best-effort: scripts/Makefile.lib hardcodes `python2` for mkdtboimg.py
+      # and 24.04 has no python2 package. The AnyKernel3 zip deliberately does
+      # not ship a dtbo, so this failing does not affect the flashable zip.
+      - name: Build dtbo.img (optional)
+        continue-on-error: true
+        run: |
+          export PATH="$PWD/gcc32/bin:$PWD/gcc64/bin:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-elf- CROSS_COMPILE_ARM32=arm-eabi- \
+            LD="$PWD/gcc64/bin/aarch64-elf-ld.lld" \
+            AR=llvm-ar NM=llvm-nm OBJDUMP=llvm-objdump \
+            OBJCOPY=llvm-objcopy STRIP=llvm-strip \
+            HOSTAR=llvm-ar HOSTCC=gcc CC=aarch64-elf-gcc \
+            dtbo.img || echo "::warning::dtbo.img skipped (needs python2)"
+
+      - name: Verify the build
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/gcc64/bin:$PATH"
+          echo "release: $(cat out/include/config/kernel.release)"
+          strings out/vmlinux | grep -m1 "Linux version 4.14"
+          # A manual hook that was never wired in fails silently, so check the
+          # symbols really made it into vmlinux.
+          if grep -q '^CONFIG_KSU=y' out/.config; then
+            llvm-nm out/vmlinux | grep -E ' (ksu_kernelsu_init|ksu_handle_execveat|ksu_handle_faccessat|ksu_handle_stat|ksu_handle_vfs_read|ksu_handle_devpts)$' \
+              || { echo "::error::CONFIG_KSU=y but KernelSU symbols are missing"; exit 1; }
+          fi
+          if grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then
+            test "$(llvm-nm out/vmlinux | grep -cE ' [Tt] susfs_')" -gt 20 \
+              || { echo "::error::CONFIG_KSU_SUSFS=y but susfs symbols are missing"; exit 1; }
+          fi
+          # Wi-Fi is compiled in on this tree; a kernel without it boots fine
+          # and then has no wlan at all, so fail loudly instead.
+          test "$(llvm-nm out/vmlinux | grep -cE 'wlan_hdd|wmi_unified')" -gt 100 \
+            || { echo "::error::qcacld/WLAN symbols missing from vmlinux"; exit 1; }
+          ls -l out/arch/arm64/boot/Image
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github
+          cp anykernel/anykernel.sh ak3/anykernel.sh
+          cp out/arch/arm64/boot/Image ak3/Image
+          NAME="NetErnels-SukiSU-SUSFS-$(cat out/include/config/kernel.release)-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)"
+          (cd ak3 && zip -r9 "../${NAME}.zip" ./*)
+          echo "ZIP_NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: |
+            ${{ env.ZIP_NAME }}.zip
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/dtbo.img
+            out/.config
+          if-no-files-found: warn
